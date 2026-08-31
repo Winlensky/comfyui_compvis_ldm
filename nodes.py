@@ -7,14 +7,14 @@ This is the original pre-Stable-Diffusion model from the LDM paper
 
 import math
 import os
-import logging                      # ← добавлено: [INFO]-логи как в ядре ComfyUI
+import logging
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import folder_paths
 
-try:                                # ← добавлено: консольный прогрессбар
+try:
     from tqdm import tqdm as _tqdm
 except Exception:
     _tqdm = None
@@ -423,7 +423,7 @@ def _make_predict(unet, cond, ns, device):
 
 # ── Alpha-space samplers (ddim / ddpm / plms) ────────────────────
 
-# ── Alpha-space: вся скалярная математика в fp64 ─────────────────
+# ── Alpha-space: in fp64 ─────────────────
 
 def _sample_ancestral(predict_eps, x, sigmas, eta, pbar_update):
     n = len(sigmas) - 1
@@ -528,7 +528,6 @@ def _sample_dpmpp_2m(denoise, x, sigmas, pbar_update):
             break
         den = denoise(x, s)
         ratio = s2 / s
-        # s2 == s (дубликаты из-за округления) даёт log(1)=0 в знаменателе
         if old_den is None or s2 == 0 or s2 == s:
             x = ratio * x + (1.0 - ratio) * den
         else:
@@ -567,7 +566,6 @@ def run_sampler(name, scheduler, unet, cond, ns, x_in,
 
     n = len(sigmas) - 1
 
-    # Прогрессбар фронтенда ComfyUI (если доступен)
     ui_pbar = None
     try:
         import comfy.utils
@@ -575,7 +573,6 @@ def run_sampler(name, scheduler, unet, cond, ns, x_in,
     except Exception:
         ui_pbar = None
 
-    # Консольный прогрессбар — тот же формат, что у ядра ComfyUI
     console_pbar = None
     if _tqdm is not None:
         console_pbar = _tqdm(
@@ -755,7 +752,7 @@ class LDMCheckpointLoader:
     DESCRIPTION = (
         "Loads a CompVis Latent Diffusion (LDM) checkpoint from ComfyUI/models/ldm.\n\n"
         "This is the original 2021 LDM architecture (Rombach et al.) with a BERT-based "
-        "text encoder, NOT Stable Diffusion. The model operates in a 4-channel latent "
+        "text encoder. The model operates in a 4-channel latent "
         "space with 8× spatial downsampling (f8 VAE).\n\n"
         "Outputs: MODEL / BERT / VAE.\n\n"
         "precision controls compute dtype:\n"
@@ -809,7 +806,6 @@ class LDMCheckpointLoader:
 
         mm = MemoryManager(strategy=memory_mode, device=device)
 
-        # ── INFO-строки в стиле model_management ──
         logging.info(f"VAE load device: {device}, offload device: {offload}, dtype: {dtype}")
         vae = _build_vae(dtype)
         m, u = vae.load_state_dict(parts["vae"], strict=False)
@@ -854,7 +850,7 @@ class LDMBERTTextEncode:
         "• Lowercase is fine — the tokenizer is uncased.\n"
         "• Avoid complex syntax, negations, or long narratives.\n"
         "• Single-subject descriptions work best: 'a red car', 'mountain landscape'.\n"
-        "• This model was trained WITHOUT classifier-free guidance — there is no "
+        "• This model was trained without classifier-free guidance — there is no "
         "negative prompt."
     )
 
@@ -944,7 +940,7 @@ class LDMSampler:
         "exponential, cosine).\n\n"
         "denoise=1.0 generates from pure noise (txt2img). Values < 1.0 partially "
         "denoise an existing latent (img2img).\n\n"
-        "NOTE: This model was trained WITHOUT classifier-free guidance. "
+        "NOTE: This model was trained without classifier-free guidance. "
         "There is no negative prompt and no CFG scale."
     )
 
@@ -952,7 +948,7 @@ class LDMSampler:
     def INPUT_TYPES(cls):
         return {"required": {
             "model": ("LDM_MODEL", {
-                "tooltip": "MODEL output from Load LDM Checkpoint (UNet + DDPM schedule)."}),
+                "tooltip": "MODEL output from Load LDM Checkpoint."}),
             "positive": ("LDM_CONDITIONING", {
                 "tooltip": "CONDITIONING from BERT Text Encode node."}),
             "latent_image": ("LDM_LATENT", {
