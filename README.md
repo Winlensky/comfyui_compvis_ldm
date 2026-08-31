@@ -31,7 +31,10 @@ Unlike newer models (like Stable Diffusion 1.5), this specific pipeline relies o
   * `latent-diffusion-f8-large-fp16.safetensors` (Optimized precision, ~3GB)
   * `latent-diffusion-f8-large-jack000-finetuned-fp16.safetensors` (Finetuned version by jack000 for better structural composition)
 
-Place downloaded files into your standard ComfyUI checkpoint folders or navigate them via your custom load paths.
+### 📂 Where to place the files:
+Place the downloaded `.safetensors` files strictly into your ComfyUI models directory under the dedicated LDM folder:
+```text
+(\ComfyUI\models\ldm\ \%\%\)MAGIT_PARSER_PROTECT%%```
 
 ## 🛠️ Usage & Node Workflows
 
