@@ -1,0 +1,4 @@
+safetensors
+torch
+tqdm
+transformers
