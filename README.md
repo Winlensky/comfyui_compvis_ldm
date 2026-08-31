@@ -32,7 +32,7 @@ Unlike newer models (like Stable Diffusion 1.5), this specific pipeline relies o
   * `latent-diffusion-f8-large-jack000-finetuned-fp16.safetensors` (Finetuned version by jack000 for better structural composition)
 
 ### 📂 Where to place the files:
-Place the downloaded `.safetensors` files strictly into your ComfyUI models directory under the dedicated LDM folder: 'ComfyUI\models\ldm'
+Place the downloaded `.safetensors` files strictly into your ComfyUI models directory under the dedicated LDM folder: `ComfyUI\models\ldm`
 
 ## 🛠️ Usage & Node Workflows
 
