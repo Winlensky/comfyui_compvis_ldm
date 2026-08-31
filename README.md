@@ -1,4 +1,5 @@
 # ComfyUI Custom Nodes for Latent Diffusion (CompVis F8 Large)
+<img width="1583" height="852" alt="image" src="https://github.com/user-attachments/assets/b76c6c5e-e0f9-49ca-a78a-93b0e882f990" />
 
 A set of custom nodes for **ComfyUI** designed to natively initialize and run the historic original **Latent Diffusion Model (LDM) F8 Large** architecture from CompVis. 
 
