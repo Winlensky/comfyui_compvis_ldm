@@ -22,11 +22,13 @@ except Exception:
 # ATTENTION BACKEND SELECTION (fully automatic)
 # Priority: flash > sdpa (default) > split > quad > pytorch
 # Sage Attention → forced fallback to SDPA
-# Flash + fp32   → forced fallback to SDPA (warned ONCE)
+# Flash + fp32   → SDPA for fp32 ONLY; fp16/bf16 keep Flash
 # The active backend is ALWAYS printed to the console.
 # ════════════════════════════════════════════════════════════════
 
-_ATTENTION_BACKEND: str | None = None
+_ATTENTION_BACKEND: str | None = None   # requested backend from CLI (cached)
+_FLASH_KERNEL_OK: bool | None = None    # session-level flash kernel availability
+_EFFECTIVE: dict = {}                   # dtype → effective backend (cached)
 _WARNED: set = set()
 
 
@@ -62,39 +64,47 @@ def _backend_from_cli() -> str:
 
 
 def _get_attention_backend() -> str:
-    """Resolve & cache the backend from CLI flags; always printed."""
+    """Requested backend (CLI flags); cached; printed once."""
     global _ATTENTION_BACKEND
     if _ATTENTION_BACKEND is not None:
         return _ATTENTION_BACKEND
 
     _ATTENTION_BACKEND = _backend_from_cli()
-    # print() instead of logging.info → always visible in the console
-    print(f"[LDM] Attention backend: {_ATTENTION_BACKEND} "
+    print(f"[LDM] Attention backend requested: {_ATTENTION_BACKEND} "
           f"(source: cli flags / default)")
     return _ATTENTION_BACKEND
 
 
-def _downgrade_flash_to_sdpa(key: str, msg: str):
-    """Permanent flash→sdpa downgrade; warning printed once."""
-    global _ATTENTION_BACKEND
-    _ATTENTION_BACKEND = "sdpa"
-    _warn_once(key, msg)
-    print("[LDM] Attention backend: sdpa (downgraded from flash)")
-
-
 def resolve_attention_backend(dtype=None) -> str:
     """
-    Final backend for the given compute dtype.
-    Flash + fp32 is impossible → permanent downgrade to SDPA (warned once).
+    Effective backend for the given compute dtype (cached PER DTYPE).
+
+    Flash + fp32 → SDPA *only while dtype is fp32*.
+    Reload the checkpoint with fp16/bf16 → Flash returns automatically.
     """
-    backend = _get_attention_backend()
-    if backend == "flash" and dtype == torch.float32:
-        _downgrade_flash_to_sdpa(
-            "flash_fp32",
-            "[LDM] Flash Attention does not support fp32. "
-            "Falling back to SDPA.")
-        backend = "sdpa"
-    return backend
+    if dtype in _EFFECTIVE:
+        return _EFFECTIVE[dtype]
+
+    requested = _get_attention_backend()
+    eff = requested
+
+    if requested == "flash":
+        if dtype == torch.float32:
+            eff = "sdpa"
+            _warn_once(
+                "flash_fp32",
+                "[LDM] Flash Attention does not support fp32. "
+                "Using SDPA for fp32 (fp16/bf16 keep Flash).")
+        elif _FLASH_KERNEL_OK is False:
+            eff = "sdpa"
+
+    _EFFECTIVE[dtype] = eff
+    if eff != requested:
+        print(f"[LDM] Attention backend for {dtype}: {eff} "
+              f"(requested '{requested}' unavailable for this dtype)")
+    else:
+        print(f"[LDM] Attention backend for {dtype}: {eff}")
+    return eff
 
 
 # ── Split / Quad helpers (memory-saving chunked attention) ───────
@@ -155,6 +165,7 @@ def _attention_dispatch(q, k, v, dim_head):
     q, k, v: [B, heads, N, dim_head]
     Returns: [B, heads, N, dim_head]
     """
+    global _FLASH_KERNEL_OK
     backend = resolve_attention_backend(q.dtype)
 
     if backend == "flash":
@@ -162,10 +173,14 @@ def _attention_dispatch(q, k, v, dim_head):
             with _sdpa_kernel_context("flash"):
                 return F.scaled_dot_product_attention(q, k, v)
         except (RuntimeError, AssertionError):
-            _downgrade_flash_to_sdpa(
+            # kernel-level failure → session-wide flag + per-dtype cache fix
+            _FLASH_KERNEL_OK = False
+            _EFFECTIVE[q.dtype] = "sdpa"
+            _warn_once(
                 "flash_kernel",
                 "[LDM] Flash Attention kernel not available. "
                 "Falling back to SDPA.")
+            print("[LDM] Attention backend: sdpa (flash kernel unavailable)")
             return F.scaled_dot_product_attention(q, k, v)
 
     if backend == "pytorch":
