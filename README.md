@@ -12,7 +12,7 @@ Unlike newer models (like Stable Diffusion 1.5), this specific pipeline relies o
 
 ## 📦 Installation
 
-### For Windows and Linux
+### Support install in ComfyUI Manager or manual install for Windows and Linux
 1. Navigate to your ComfyUI custom nodes directory inside your terminal or PowerShell.
 2. Clone this repository:
    ```powershell
