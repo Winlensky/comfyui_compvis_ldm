@@ -19,47 +19,81 @@ except Exception:
 
 
 # ════════════════════════════════════════════════════════════════
-# ATTENTION BACKEND SELECTION
+# ATTENTION BACKEND SELECTION (fully automatic)
+# Priority: flash > sdpa (default) > split > quad > pytorch
+# Sage Attention → forced fallback to SDPA
+# Flash + fp32   → forced fallback to SDPA (warned ONCE)
+# The active backend is ALWAYS printed to the console.
 # ════════════════════════════════════════════════════════════════
 
 _ATTENTION_BACKEND: str | None = None
+_WARNED: set = set()
 
-def _get_attention_backend() -> str:
-    """
-    Determines attention implementation from ComfyUI CLI flags.
-    Priority: flash > split > quad > pytorch > sdpa (default).
-    Sage Attention is NOT supported here → falls back to SDPA.
-    """
-    global _ATTENTION_BACKEND
-    if _ATTENTION_BACKEND is not None:
-        return _ATTENTION_BACKEND
 
-    backend = "sdpa"  # safe default
+def _warn_once(key: str, msg: str):
+    """Log a warning exactly once per session."""
+    if key not in _WARNED:
+        _WARNED.add(key)
+        logging.warning(msg)
 
+
+def _backend_from_cli() -> str:
+    """ComfyUI CLI flags → backend name. Default: sdpa."""
     try:
         from comfy.cli_args import args
 
         if getattr(args, "use_flash_attention", False):
-            backend = "flash"
-        elif getattr(args, "use_split_cross_attention", False):
-            backend = "split"
-        elif getattr(args, "use_quad_cross_attention", False):
-            backend = "quad"
-        elif getattr(args, "use_pytorch_cross_attention", False):
-            backend = "pytorch"
-        elif getattr(args, "use_sage_attention", False):
-            logging.warning(
+            return "flash"
+        if getattr(args, "use_split_cross_attention", False):
+            return "split"
+        if getattr(args, "use_quad_cross_attention", False):
+            return "quad"
+        if getattr(args, "use_pytorch_cross_attention", False):
+            return "pytorch"
+        if getattr(args, "use_sage_attention", False):
+            _warn_once(
+                "sage",
                 "[LDM] Sage Attention is not supported by this model. "
-                "Falling back to PyTorch SDPA."
-            )
-            backend = "sdpa"
-        else:
-            backend = "sdpa"
+                "Falling back to PyTorch SDPA.")
+            return "sdpa"
     except (ImportError, AttributeError):
-        backend = "sdpa"
+        pass
+    return "sdpa"
 
-    _ATTENTION_BACKEND = backend
-    logging.info(f"[LDM] Attention backend: {backend}")
+
+def _get_attention_backend() -> str:
+    """Resolve & cache the backend from CLI flags; always printed."""
+    global _ATTENTION_BACKEND
+    if _ATTENTION_BACKEND is not None:
+        return _ATTENTION_BACKEND
+
+    _ATTENTION_BACKEND = _backend_from_cli()
+    # print() instead of logging.info → always visible in the console
+    print(f"[LDM] Attention backend: {_ATTENTION_BACKEND} "
+          f"(source: cli flags / default)")
+    return _ATTENTION_BACKEND
+
+
+def _downgrade_flash_to_sdpa(key: str, msg: str):
+    """Permanent flash→sdpa downgrade; warning printed once."""
+    global _ATTENTION_BACKEND
+    _ATTENTION_BACKEND = "sdpa"
+    _warn_once(key, msg)
+    print("[LDM] Attention backend: sdpa (downgraded from flash)")
+
+
+def resolve_attention_backend(dtype=None) -> str:
+    """
+    Final backend for the given compute dtype.
+    Flash + fp32 is impossible → permanent downgrade to SDPA (warned once).
+    """
+    backend = _get_attention_backend()
+    if backend == "flash" and dtype == torch.float32:
+        _downgrade_flash_to_sdpa(
+            "flash_fp32",
+            "[LDM] Flash Attention does not support fp32. "
+            "Falling back to SDPA.")
+        backend = "sdpa"
     return backend
 
 
@@ -73,8 +107,8 @@ def _split_cross_attention(q, k, v, dim_head, chunk_size=512):
 
     for i in range(0, N, chunk_size):
         end = min(i + chunk_size, N)
-        q_chunk = q[:, :, i:end]                       # [B, H, chunk, D]
-        attn = (q_chunk @ k.transpose(-2, -1)) * scale  # [B, H, chunk, Nk]
+        q_chunk = q[:, :, i:end]
+        attn = (q_chunk @ k.transpose(-2, -1)) * scale
         attn = attn.softmax(dim=-1)
         out[:, :, i:end] = attn @ v
 
@@ -86,6 +120,34 @@ def _quad_cross_attention(q, k, v, dim_head, chunk_size=256):
     return _split_cross_attention(q, k, v, dim_head, chunk_size=chunk_size)
 
 
+# ── SDPA kernel context (PyTorch ≥ 2.2 vs older) ────────────────
+
+try:
+    from torch.nn.attention import SDPBackend as _SB
+    _HAS_NEW_SDPA = True
+except ImportError:
+    _SB = None
+    _HAS_NEW_SDPA = False
+
+
+def _sdpa_kernel_context(kind: str):
+    """
+    Context manager restricting SDPA backends.
+    kind: "flash" (flash+efficient) or "math".
+    Supports PyTorch ≥ 2.2 (sdpa_kernel) and 2.0/2.1 (sdp_kernel).
+    """
+    if _HAS_NEW_SDPA:
+        backends = ([_SB.FLASH_ATTENTION, _SB.EFFICIENT_ATTENTION]
+                    if kind == "flash" else [_SB.MATH])
+        return torch.nn.attention.sdpa_kernel(backends)
+
+    if kind == "flash":
+        return torch.backends.cuda.sdp_kernel(
+            enable_flash=True, enable_math=False, enable_mem_efficient=True)
+    return torch.backends.cuda.sdp_kernel(
+        enable_flash=False, enable_math=True, enable_mem_efficient=False)
+
+
 # ── Unified dispatch ─────────────────────────────────────────────
 
 def _attention_dispatch(q, k, v, dim_head):
@@ -93,39 +155,34 @@ def _attention_dispatch(q, k, v, dim_head):
     q, k, v: [B, heads, N, dim_head]
     Returns: [B, heads, N, dim_head]
     """
-    backend = _get_attention_backend()
+    backend = resolve_attention_backend(q.dtype)
 
     if backend == "flash":
-        # Force flash-attention kernel via SDPA context
         try:
-            with torch.nn.attention.sdpa_kernel(
-                [torch.nn.attention.SDPBackend.FLASH_ATTENTION,
-                 torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION]
-            ):
+            with _sdpa_kernel_context("flash"):
                 return F.scaled_dot_product_attention(q, k, v)
-        except (AttributeError, RuntimeError):
-            # PyTorch < 2.2 or flash unavailable → plain SDPA
+        except (RuntimeError, AssertionError):
+            _downgrade_flash_to_sdpa(
+                "flash_kernel",
+                "[LDM] Flash Attention kernel not available. "
+                "Falling back to SDPA.")
             return F.scaled_dot_product_attention(q, k, v)
 
-    elif backend == "pytorch":
-        # Explicit PyTorch SDPA (math backend allowed)
+    if backend == "pytorch":
         try:
-            with torch.nn.attention.sdpa_kernel(
-                [torch.nn.attention.SDPBackend.MATH]
-            ):
+            with _sdpa_kernel_context("math"):
                 return F.scaled_dot_product_attention(q, k, v)
-        except (AttributeError, RuntimeError):
+        except (RuntimeError, AssertionError):
             return F.scaled_dot_product_attention(q, k, v)
 
-    elif backend == "split":
+    if backend == "split":
         return _split_cross_attention(q, k, v, dim_head)
 
-    elif backend == "quad":
+    if backend == "quad":
         return _quad_cross_attention(q, k, v, dim_head)
 
-    else:
-        # "sdpa" — default: let PyTorch pick the best kernel
-        return F.scaled_dot_product_attention(q, k, v)
+    # "sdpa" — default: PyTorch picks the best kernel
+    return F.scaled_dot_product_attention(q, k, v)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1102,13 +1159,18 @@ class LDMSampler:
         mm = model["mm"]
         dtype = model.get("dtype", torch.float32)
 
+        # ── always visible: which attention backend is used for this run ──
+        backend = resolve_attention_backend(dtype)
+        print(f"[LDM] {sampler_name} | attention backend: {backend} | dtype: {dtype}")
+
         # ── scheduler compatibility check ──
         family, fn = SAMPLER_TABLE[sampler_name]
         valid = ALPHA_SCHEDULERS if family == "alpha" else SIGMA_SCHEDULERS
         if scheduler not in valid:
             fallback = "ddim_uniform" if family == "alpha" else "karras"
             print(f"[LDM] WARNING: scheduler '{scheduler}' is incompatible with "
-                  f"sampler '{sampler_name}'. Falling back to '{fallback}'.")
+                  f"alpha-space sampler '{sampler_name}'. "
+                  f"Falling back to '{fallback}'.")
             scheduler = fallback
 
         with mm.use(model["comp"]) as unet:
