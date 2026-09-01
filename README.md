@@ -19,10 +19,10 @@ Unlike newer models (like Stable Diffusion 1.5), this specific pipeline relies o
    git clone https://github.com/Winlensky/comfyui_compvis_ldm.git
    ```
 3. Install requirements (Most likely not needed):
-```
-cd comfyui_compvis_ldm
-pip install -r requirements.txt
-```
+   ```
+   cd comfyui_compvis_ldm
+   pip install -r requirements.txt
+   ```
 5.  Restart ComfyUI. The nodes will be registered automatically using your embedded Python environment.
 
 ## 🗂️ Model Downloads
