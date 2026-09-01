@@ -4,11 +4,9 @@ Architecture: BERT text encoder + UNet with Spatial Transformers + f8 VAE.
 This is the original pre-Stable-Diffusion model from the LDM paper
 (Rombach et al., "High-Resolution Image Synthesis with Latent Diffusion Models").
 """
-
 import math
 import os
 import logging
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,6 +16,116 @@ try:
     from tqdm import tqdm as _tqdm
 except Exception:
     _tqdm = None
+
+
+# ════════════════════════════════════════════════════════════════
+# ATTENTION BACKEND SELECTION
+# ════════════════════════════════════════════════════════════════
+
+_ATTENTION_BACKEND: str | None = None
+
+def _get_attention_backend() -> str:
+    """
+    Determines attention implementation from ComfyUI CLI flags.
+    Priority: flash > split > quad > pytorch > sdpa (default).
+    Sage Attention is NOT supported here → falls back to SDPA.
+    """
+    global _ATTENTION_BACKEND
+    if _ATTENTION_BACKEND is not None:
+        return _ATTENTION_BACKEND
+
+    backend = "sdpa"  # safe default
+
+    try:
+        from comfy.cli_args import args
+
+        if getattr(args, "use_flash_attention", False):
+            backend = "flash"
+        elif getattr(args, "use_split_cross_attention", False):
+            backend = "split"
+        elif getattr(args, "use_quad_cross_attention", False):
+            backend = "quad"
+        elif getattr(args, "use_pytorch_cross_attention", False):
+            backend = "pytorch"
+        elif getattr(args, "use_sage_attention", False):
+            logging.warning(
+                "[LDM] Sage Attention is not supported by this model. "
+                "Falling back to PyTorch SDPA."
+            )
+            backend = "sdpa"
+        else:
+            backend = "sdpa"
+    except (ImportError, AttributeError):
+        backend = "sdpa"
+
+    _ATTENTION_BACKEND = backend
+    logging.info(f"[LDM] Attention backend: {backend}")
+    return backend
+
+
+# ── Split / Quad helpers (memory-saving chunked attention) ───────
+
+def _split_cross_attention(q, k, v, dim_head, chunk_size=512):
+    """Process attention in chunks over the query sequence to save VRAM."""
+    B, H, N, _ = q.shape
+    scale = dim_head ** -0.5
+    out = torch.empty_like(q)
+
+    for i in range(0, N, chunk_size):
+        end = min(i + chunk_size, N)
+        q_chunk = q[:, :, i:end]                       # [B, H, chunk, D]
+        attn = (q_chunk @ k.transpose(-2, -1)) * scale  # [B, H, chunk, Nk]
+        attn = attn.softmax(dim=-1)
+        out[:, :, i:end] = attn @ v
+
+    return out
+
+
+def _quad_cross_attention(q, k, v, dim_head, chunk_size=256):
+    """Quad-tree style chunked attention (smaller chunks than split)."""
+    return _split_cross_attention(q, k, v, dim_head, chunk_size=chunk_size)
+
+
+# ── Unified dispatch ─────────────────────────────────────────────
+
+def _attention_dispatch(q, k, v, dim_head):
+    """
+    q, k, v: [B, heads, N, dim_head]
+    Returns: [B, heads, N, dim_head]
+    """
+    backend = _get_attention_backend()
+
+    if backend == "flash":
+        # Force flash-attention kernel via SDPA context
+        try:
+            with torch.nn.attention.sdpa_kernel(
+                [torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+                 torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION]
+            ):
+                return F.scaled_dot_product_attention(q, k, v)
+        except (AttributeError, RuntimeError):
+            # PyTorch < 2.2 or flash unavailable → plain SDPA
+            return F.scaled_dot_product_attention(q, k, v)
+
+    elif backend == "pytorch":
+        # Explicit PyTorch SDPA (math backend allowed)
+        try:
+            with torch.nn.attention.sdpa_kernel(
+                [torch.nn.attention.SDPBackend.MATH]
+            ):
+                return F.scaled_dot_product_attention(q, k, v)
+        except (AttributeError, RuntimeError):
+            return F.scaled_dot_product_attention(q, k, v)
+
+    elif backend == "split":
+        return _split_cross_attention(q, k, v, dim_head)
+
+    elif backend == "quad":
+        return _quad_cross_attention(q, k, v, dim_head)
+
+    else:
+        # "sdpa" — default: let PyTorch pick the best kernel
+        return F.scaled_dot_product_attention(q, k, v)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -50,11 +158,14 @@ class _Attention(nn.Module):
     def forward(self, x):
         B, N, _ = x.shape
         h, d = self.h, self.d
+
         q = self.to_q(x).view(B, N, h, d).transpose(1, 2)
         k = self.to_k(x).view(B, N, h, d).transpose(1, 2)
         v = self.to_v(x).view(B, N, h, d).transpose(1, 2)
-        attn = (q @ k.transpose(-2, -1)) * (d ** -0.5)
-        out = (attn.softmax(-1) @ v).transpose(1, 2).reshape(B, N, h * d)
+
+        out = _attention_dispatch(q, k, v, d)
+
+        out = out.transpose(1, 2).reshape(B, N, h * d)
         return self.to_out(out)
 
 
@@ -157,10 +268,13 @@ class _UNetAttn(nn.Module):
         B, N, C = x.shape
         h = self.heads
         d = C // h
+
         q = self.to_q(x).view(B, N, h, d).transpose(1, 2)
         k = self.to_k(ctx).view(B, -1, h, d).transpose(1, 2)
         v = self.to_v(ctx).view(B, -1, h, d).transpose(1, 2)
-        out = (F.softmax(q @ k.transpose(-2, -1) * (d ** -0.5), -1) @ v)
+
+        out = _attention_dispatch(q, k, v, d)
+
         out = out.transpose(1, 2).reshape(B, N, C)
         return self.to_out[0](out)
 
@@ -251,7 +365,6 @@ class LDMUNet(nn.Module):
             nn.Linear(ch, emb_ch), nn.SiLU(), nn.Linear(emb_ch, emb_ch))
 
         T = _SpatialTransformer
-
         self.input_blocks = nn.ModuleList([
             nn.ModuleList([nn.Conv2d(4, ch, 3, padding=1)]),
             nn.ModuleList([_ResBlock(ch, emb_ch, ch),   T(ch, ctx_dim, num_heads)]),
@@ -296,6 +409,7 @@ class LDMUNet(nn.Module):
     def forward(self, x, timesteps, context):
         emb = self.time_embed(
             _timestep_embedding(timesteps, 320).to(x.dtype))
+
         skips = []
         h = x
         for block in self.input_blocks:
@@ -423,8 +537,6 @@ def _make_predict(unet, cond, ns, device):
 
 # ── Alpha-space samplers (ddim / ddpm / plms) ────────────────────
 
-# ── Alpha-space: in fp64 ─────────────────
-
 def _sample_ancestral(predict_eps, x, sigmas, eta, pbar_update):
     n = len(sigmas) - 1
     for i in range(n):
@@ -476,6 +588,8 @@ def _sample_plms(predict_eps, x, sigmas, eta, pbar_update):
         pbar_update(i)
     return x
 
+
+# ── Sigma-space samplers ─────────────────────────────────────────
 
 def _sample_euler(denoise, x, sigmas, pbar_update):
     for i in range(len(sigmas) - 1):
@@ -558,14 +672,12 @@ def run_sampler(name, scheduler, unet, cond, ns, x_in,
                 steps, eta, denoise, device, dtype=torch.float32):
     sigmas = make_sigmas(scheduler, steps, ns).to(device=device, dtype=dtype)
     sigmas = torch.cat([sigmas[sigmas > 0], sigmas.new_zeros(1)])
-
     cut = int(round((1.0 - denoise) * (len(sigmas) - 1)))
     sigmas = sigmas[cut:]
 
     predict_eps, denoise_fn = _make_predict(unet, cond, ns, device)
 
     n = len(sigmas) - 1
-
     ui_pbar = None
     try:
         import comfy.utils
@@ -616,6 +728,7 @@ def run_sampler(name, scheduler, unet, cond, ns, x_in,
             console_pbar.close()
 
     return result
+
 
 # ════════════════════════════════════════════════════════════════
 # MEMORY MANAGEMENT
@@ -699,7 +812,6 @@ class MemoryManager:
 # ════════════════════════════════════════════════════════════════
 
 _TOKENIZER = None
-
 
 def _get_tokenizer():
     global _TOKENIZER
@@ -790,7 +902,6 @@ class LDMCheckpointLoader:
         device = "cpu" if memory_mode == "cpu" else (
             "cuda" if torch.cuda.is_available() else "cpu")
         offload = "cpu"
-
         dtype_map = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
         dtype = dtype_map[precision]
 
@@ -997,8 +1108,7 @@ class LDMSampler:
         if scheduler not in valid:
             fallback = "ddim_uniform" if family == "alpha" else "karras"
             print(f"[LDM] WARNING: scheduler '{scheduler}' is incompatible with "
-                  f"alpha-space sampler '{sampler_name}'. "
-                  f"Falling back to '{fallback}'.")
+                  f"sampler '{sampler_name}'. Falling back to '{fallback}'.")
             scheduler = fallback
 
         with mm.use(model["comp"]) as unet:
@@ -1144,7 +1254,6 @@ class LDMSaveCheckpoint:
         "All tensors are saved in the precision the model was loaded with "
         "(fp32 / fp16 / bf16). model_ema weights are not saved."
     )
-
     OUTPUT_NODE = True
 
     @classmethod
@@ -1169,10 +1278,9 @@ class LDMSaveCheckpoint:
     def save(self, model, bert, vae, filename):
         from safetensors.torch import save_file
 
-        # Determine target dtype from the loaded model
         dtype = model.get("dtype", torch.float32)
-
         sd = {}
+
         for k, v in model["comp"].module.state_dict().items():
             sd["model.diffusion_model." + k] = v.detach().cpu().to(dtype).contiguous()
         for k, v in bert["comp"].module.state_dict().items():
@@ -1180,7 +1288,6 @@ class LDMSaveCheckpoint:
         for k, v in vae["comp"].module.state_dict().items():
             sd["first_stage_model." + k] = v.detach().cpu().to(dtype).contiguous()
 
-        # Noise schedule tensors
         other = model.get("other")
         if other is None:
             other = _rebuild_other(model["noise_schedule"])
