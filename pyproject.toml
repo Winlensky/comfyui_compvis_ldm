@@ -1,0 +1,13 @@
+[project]
+name = "comfyui_compvis_ldm"
+description = "Native custom nodes to initialize and run original Latent Diffusion Model (LDM) F8 Large architecture from CompVis with a BERT text encoder."
+version = "1.0.6"
+
+[project.urls]
+Repository = "https://github.com/Winlensky/comfyui_compvis_ldm"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = "Winlensky"
+DisplayName = "ComfyUI Custom Nodes for Latent Diffusion (CompVis F8 Large)"
+Icon = ""
