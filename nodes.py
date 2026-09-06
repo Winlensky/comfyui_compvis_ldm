@@ -591,14 +591,26 @@ def make_sigmas(scheduler, steps, ns):
     return s
 
 
-def _make_predict(unet, cond, ns, device):
+def _make_predict(unet, cond, ns, device,
+                  cond_neg=None, cfg_scale=1.0, enable_cfg=False):
+
     def predict_eps(x, sigma):
         t = ns.sigma_to_t(sigma)
         tt = torch.full((x.shape[0],), t, device=device, dtype=torch.long)
+
+        if enable_cfg and cond_neg is not None:
+            # --- CFG: один проход на удвоенном батче ---
+            x2   = torch.cat([x, x], dim=0)
+            tt2  = torch.cat([tt, tt], dim=0)
+            ctx2 = torch.cat([cond, cond_neg], dim=0)
+            eps2 = unet(x2, tt2, context=ctx2)
+            eps_cond, eps_uncond = eps2.chunk(2, dim=0)
+            return eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+
+        # --- обычный прогон без CFG ---
         return unet(x, tt, context=cond)
 
     def denoise(y, sigma):
-        """y is in x0 + sigma*eps space; returns predicted x0."""
         s = float(sigma)
         scale = math.sqrt(1.0 + s * s)
         eps = predict_eps(y / scale, sigma)
@@ -741,15 +753,21 @@ SAMPLER_TABLE = {
 
 @torch.no_grad()
 def run_sampler(name, scheduler, unet, cond, ns, x_in,
-                steps, eta, denoise, device, dtype=torch.float32):
+                steps, eta, denoise, device, dtype=torch.float32,
+                cond_neg=None, cfg_scale=1.0, enable_cfg=False):
     sigmas = make_sigmas(scheduler, steps, ns).to(device=device, dtype=dtype)
     sigmas = torch.cat([sigmas[sigmas > 0], sigmas.new_zeros(1)])
+
     cut = int(round((1.0 - denoise) * (len(sigmas) - 1)))
     sigmas = sigmas[cut:]
 
-    predict_eps, denoise_fn = _make_predict(unet, cond, ns, device)
+    predict_eps, denoise_fn = _make_predict(
+        unet, cond, ns, device,
+        cond_neg=cond_neg, cfg_scale=cfg_scale, enable_cfg=enable_cfg)
 
     n = len(sigmas) - 1
+
+    # ── прогресс-бары ──
     ui_pbar = None
     try:
         import comfy.utils
@@ -760,19 +778,15 @@ def run_sampler(name, scheduler, unet, cond, ns, x_in,
     console_pbar = None
     if _tqdm is not None:
         console_pbar = _tqdm(
-            total=n,
-            desc=f"[LDM] {name}",
-            unit="it",
-            dynamic_ncols=True,
-            leave=True,
-        )
+            total=n, desc=f"[LDM] {name}", unit="it",
+            dynamic_ncols=True, leave=True)
 
     def pbar_update(i):
         if console_pbar is not None:
             console_pbar.set_postfix(sigma=f"{float(sigmas[i]):.4f}", refresh=False)
             console_pbar.update(1)
         else:
-            print(f"[LDM] {name}: step {i + 1}/{n}  sigma={float(sigmas[i]):.4f}")
+            print(f"[LDM] {name}: step {i+1}/{n}  sigma={float(sigmas[i]):.4f}")
         if ui_pbar is not None:
             ui_pbar.update_absolute(i + 1, n)
 
@@ -1028,13 +1042,19 @@ class LDMBERTTextEncode:
         "Encodes a text prompt into a conditioning tensor for the UNet.\n\n"
         "Uses the BERT-base-uncased tokenizer (77 tokens max). The encoder is a "
         "64-layer transformer with 1280-dim hidden states and 8 attention heads.\n\n"
-        "Prompting tips for this model:\n"
-        "• Keep prompts short and concrete (BERT has limited compositional understanding).\n"
+        "Usage:\n"
+        "• For positive prompt: connect output to Sampler → positive.\n"
+        "• For negative prompt: create a second instance of this node, write "
+        "unwanted concepts, connect to Sampler → negative (optional input).\n"
+        "• An empty string produces a near-zero conditioning suitable as "
+        "unconditional input.\n\n"
+        "Prompting tips:\n"
+        "• Keep prompts short and concrete (BERT has limited compositional "
+        "understanding).\n"
         "• Lowercase is fine — the tokenizer is uncased.\n"
-        "• Avoid complex syntax, negations, or long narratives.\n"
-        "• Single-subject descriptions work best: 'a red car', 'mountain landscape'.\n"
-        "• This model was trained without classifier-free guidance — there is no "
-        "negative prompt."
+        "• Single-subject descriptions work best: 'a red car', 'mountain "
+        "landscape'.\n"
+        "• For negative prompts, list what to avoid: 'blurry, text, watermark'."
     )
 
     @classmethod
@@ -1045,7 +1065,7 @@ class LDMBERTTextEncode:
             "text": ("STRING", {
                 "multiline": True, "default": "",
                 "tooltip": "Text prompt. BERT tokenizer, 77 tokens max. "
-                           "Keep it short and descriptive."}),
+                           "Use for positive or negative conditioning."}),
         }}
 
     RETURN_TYPES = ("LDM_CONDITIONING",)
@@ -1055,7 +1075,7 @@ class LDMBERTTextEncode:
 
     @torch.no_grad()
     def encode(self, bert, text):
-        mm = bert["mm"]
+        mm    = bert["mm"]
         dtype = bert.get("dtype", torch.float32)
         with mm.use(bert["comp"]) as tenc:
             ids = _get_tokenizer()(
@@ -1092,7 +1112,7 @@ class LDMEmptyLatent:
                 "tooltip": "Image height in pixels. Must be a multiple of 8. "
                            "Native training resolution is 256."}),
             "batch_size": ("INT", {
-                "default": 1, "min": 1, "max": 8,
+                "default": 1, "min": 1, "max": 20,
                 "tooltip": "Number of images to generate in a single pass."}),
         }}
 
@@ -1119,46 +1139,65 @@ class LDMSampler:
         "  Compatible schedulers: ddim_uniform, linear, beta.\n\n"
         "Samplers (sigma-space, k-diffusion family):\n"
         "• euler / euler_ancestral / heun / dpmpp_2m.\n"
-        "  Compatible schedulers: all (ddim_uniform, linear, beta, karras, "
-        "exponential, cosine).\n\n"
+        "  Compatible schedulers: all.\n\n"
+        "CFG (Classifier-Free Guidance):\n"
+        "• enable_cfg=True is activate guidance. The model performs two passes. UNet "
+        "(positive + negative) in a single batch call.\n"
+        "• cfg_scale controls the strength of the prompt follow (1.0 = no effect, "
+        "7–12 recomended).\n"
+        "• If the negative input is not connected, zero (null) "
+        "conditioning is used.\n"
+        "• enable_cfg=False — classic without guidance.\n\n"
         "denoise=1.0 generates from pure noise (txt2img). Values < 1.0 partially "
         "denoise an existing latent (img2img).\n\n"
-        "NOTE: This model was trained without classifier-free guidance. "
-        "There is no negative prompt and no CFG scale."
     )
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {
-            "model": ("LDM_MODEL", {
-                "tooltip": "MODEL output from Load LDM Checkpoint."}),
-            "positive": ("LDM_CONDITIONING", {
-                "tooltip": "CONDITIONING from BERT Text Encode node."}),
-            "latent_image": ("LDM_LATENT", {
-                "tooltip": "Starting latent: empty (txt2img) or encoded image (img2img)."}),
-            "seed": ("INT", {
-                "default": 42, "min": 0, "max": 0xffffffffffffffff,
-                "tooltip": "Random seed for initial noise."}),
-            "steps": ("INT", {
-                "default": 50, "min": 1, "max": 1000,
-                "tooltip": "Number of denoising steps. k-diffusion samplers converge "
-                           "well at 20–30 steps."}),
-            "sampler_name": (list(SAMPLER_TABLE.keys()), {
-                "tooltip": "ddim/ddpm/plms are alpha-space (LDM paper native). "
-                           "euler/heun/dpmpp_2m are sigma-space (k-diffusion)."}),
-            "scheduler": (list(SIGMA_SCHEDULERS), {
-                "tooltip": "Sigma schedule. Alpha-space samplers (ddim/ddpm/plms) "
-                           "accept: ddim_uniform, linear, beta. "
-                           "Sigma-space samplers accept all schedulers."}),
-            "eta": ("FLOAT", {
-                "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                "tooltip": "Stochasticity for DDIM only. 0 = deterministic, 1 ≈ DDPM. "
-                           "Ignored by other samplers."}),
-            "denoise": ("FLOAT", {
-                "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                "tooltip": "1.0 = full generation from noise; < 1.0 = partial denoising "
-                           "(img2img)."}),
-        }}
+        return {
+            "required": {
+                "model": ("LDM_MODEL", {
+                    "tooltip": "MODEL output from Load LDM Checkpoint."}),
+                "positive": ("LDM_CONDITIONING", {
+                    "tooltip": "CONDITIONING from BERT Text Encode node."}),
+                "latent_image": ("LDM_LATENT", {
+                    "tooltip": "Starting latent: empty (txt2img) or encoded image (img2img)."}),
+                "seed": ("INT", {
+                    "default": 42, "min": 0, "max": 0xffffffffffffffff,
+                    "tooltip": "Random seed for initial noise."}),
+                "steps": ("INT", {
+                    "default": 50, "min": 1, "max": 1000,
+                    "tooltip": "Number of denoising steps."}),
+                "enable_cfg": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable Classifier-Free Guidance. "
+                               "When True, the model uses both positive and negative "
+                               "conditioning to steer generation."}),
+                "cfg_scale": ("FLOAT", {
+                    "default": 7.5, "min": 1.0, "max": 30.0, "step": 0.5,
+                    "tooltip": "CFG strength. 1.0 = no effect. "
+                               "Higher values follow the prompt more strictly "
+                               "but may cause oversaturation. Only used when "
+                               "enable_cfg=True."}),
+                "sampler_name": (list(SAMPLER_TABLE.keys()), {
+                    "tooltip": "ddim/ddpm/plms are alpha-space. "
+                               "euler/heun/dpmpp_2m are sigma-space."}),
+                "scheduler": (list(SIGMA_SCHEDULERS), {
+                    "tooltip": "Sigma schedule."}),
+                "eta": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Stochasticity for DDIM only. 0=deterministic, 1≈DDPM."}),
+                "denoise": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "1.0 = full generation; < 1.0 = partial (img2img)."}),
+            },
+            "optional": {
+                "negative": ("LDM_CONDITIONING", {
+                    "tooltip": "Negative conditioning from a second BERT Text Encode "
+                               "node. If not connected and CFG is enabled, "
+                               "zero (empty) conditioning is used."}),
+            },
+        }
 
     RETURN_TYPES = ("LDM_LATENT",)
     RETURN_NAMES = ("LATENT",)
@@ -1166,40 +1205,58 @@ class LDMSampler:
     CATEGORY = "LDM"
 
     def sample(self, model, positive, latent_image, seed, steps,
-               sampler_name, scheduler, eta, denoise):
+               sampler_name, scheduler, eta, denoise,
+               enable_cfg, cfg_scale, negative=None):
+
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
 
-        mm = model["mm"]
+        mm    = model["mm"]
         dtype = model.get("dtype", torch.float32)
 
-        # ── always visible: which attention backend is used for this run ──
         backend = resolve_attention_backend(dtype)
-        print(f"[LDM] {sampler_name} | attention backend: {backend} | dtype: {dtype}")
+        cfg_info = (f"cfg={cfg_scale:.1f}" if enable_cfg else "cfg=off")
+        print(f"[LDM] {sampler_name} | {cfg_info} | "
+              f"attention: {backend} | dtype: {dtype}")
 
         # ── scheduler compatibility check ──
         family, fn = SAMPLER_TABLE[sampler_name]
         valid = ALPHA_SCHEDULERS if family == "alpha" else SIGMA_SCHEDULERS
         if scheduler not in valid:
             fallback = "ddim_uniform" if family == "alpha" else "karras"
-            print(f"[LDM] WARNING: scheduler '{scheduler}' is incompatible with "
-                  f"alpha-space sampler '{sampler_name}'. "
-                  f"Falling back to '{fallback}'.")
+            print(f"[LDM] WARNING: scheduler '{scheduler}' incompatible with "
+                  f"'{sampler_name}'. Falling back to '{fallback}'.")
             scheduler = fallback
 
         with mm.use(model["comp"]) as unet:
-            dev = mm.device
+            dev  = mm.device
             x_in = latent_image["samples"].to(dev, dtype=dtype)
             cond = positive["cond"].to(dev, dtype=dtype)
+
+            # batch alignment
             if cond.shape[0] != x_in.shape[0]:
                 cond = cond.repeat(x_in.shape[0], 1, 1)
+
+            # ── negative conditioning ──
+            cond_neg = None
+            if enable_cfg:
+                if negative is not None:
+                    cond_neg = negative["cond"].to(dev, dtype=dtype)
+                    if cond_neg.shape[0] != x_in.shape[0]:
+                        cond_neg = cond_neg.repeat(x_in.shape[0], 1, 1)
+                else:
+                    cond_neg = torch.zeros_like(cond)
+                    print("[LDM] CFG enabled but negative not connected — "
+                          "using zero conditioning.")
 
             lat = run_sampler(
                 sampler_name, scheduler,
                 unet, cond, model["noise_schedule"], x_in,
                 steps=steps, eta=eta, denoise=denoise,
-                device=dev, dtype=dtype)
+                device=dev, dtype=dtype,
+                cond_neg=cond_neg, cfg_scale=cfg_scale,
+                enable_cfg=enable_cfg)
 
         return ({"samples": lat.cpu()},)
 
